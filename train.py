@@ -24,6 +24,7 @@ from torch.optim import AdamW
 from transformers import HfArgumentParser, set_seed, TrainingArguments
 from transformers.trainer import Trainer
 from transformers.optimization import get_scheduler
+from transformers.callbacks import EarlyStoppingCallback
 
 from helpers import DataCollator, MAX_LEN, NUM_CATEGORIES
 from model import CategoryLayoutLMv3
@@ -39,6 +40,14 @@ class Arguments(TrainingArguments):
         default=1e-3,
         metadata={"help": "LR for category_embedding and category_scale. "
                           "Recommended 10~50x of learning_rate."}
+    )
+    early_stopping_patience: int = field(
+        default=5,
+        metadata={"help": "Number of epochs with no improvement after which training will be stopped."}
+    )
+    early_stopping_threshold: float = field(
+        default=0.001,
+        metadata={"help": "Minimum improvement required to reset the early stopping counter."}
     )
 
 
@@ -117,7 +126,17 @@ def main():
         train_dataset=train_ds,
         eval_dataset=dev_ds,
         data_collator=DataCollator(),
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold
+            )
+        ],
     )
+    # 设置只保存最优模型
+    trainer.args.save_strategy = "epoch"
+    trainer.args.save_total_limit = 1  # 只保存一个模型
+    trainer.args.load_best_model_at_end = True  # 训练结束后加载最优模型
     trainer.train()
 
 
