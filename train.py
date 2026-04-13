@@ -24,7 +24,7 @@ from torch.optim import AdamW
 from transformers import HfArgumentParser, set_seed, TrainingArguments
 from transformers.trainer import Trainer
 from transformers.optimization import get_scheduler
-from transformers.callbacks import EarlyStoppingCallback
+from transformers.trainer_callback import EarlyStoppingCallback
 
 from helpers import DataCollator, MAX_LEN, NUM_CATEGORIES
 from model import CategoryLayoutLMv3
