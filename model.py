@@ -22,21 +22,25 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
 
         hidden_size = config.hidden_size
 
-        # 1. 类别嵌入（零初始化）
+        # 1. 类别嵌入（Xavier 初始化）
         self.category_embedding = nn.Embedding(
             num_embeddings=num_categories,
             embedding_dim=hidden_size,
             padding_idx=0,
         )
-        nn.init.zeros_(self.category_embedding.weight)
+        nn.init.xavier_uniform_(self.category_embedding.weight)
+        # 保持 padding_idx 为 0
+        self.category_embedding.weight.data[0] = 0
 
-        # 2. 类别专属scale
+        # 2. 类别专属scale（Xavier 初始化）
         self.category_scale = nn.Embedding(
             num_embeddings=num_categories,
             embedding_dim=hidden_size,
             padding_idx=0,
         )
-        nn.init.zeros_(self.category_scale.weight)
+        nn.init.xavier_uniform_(self.category_scale.weight)
+        # 保持 padding_idx 为 0
+        self.category_scale.weight.data[0] = 0
 
         # 3. 上下文融合
         self.context_fusion = nn.Sequential(
@@ -47,9 +51,17 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
         )
         for module in self.context_fusion.modules():
             if isinstance(module, nn.Linear):
-                nn.init.zeros_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+        # 4. 注意力机制融合
+        self.attention_fusion = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob,
+            batch_first=True
+        )
 
     # ----------------------
     # 你原来的函数，完全保留
@@ -104,9 +116,7 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
             )
 
         # ======================
-        # 2. 【关键修复】
-        # 不让模型在融合前走 encoder！
-        # 直接融合类别信息，再统一走一次 forward
+        # 2. 类别信息融合
         # ======================
         if category_ids is not None:
             B, L = inputs_embeds.shape[:2]
@@ -117,10 +127,23 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
             cat_scale = self.category_scale(cat_ids)
             enhanced_cat_emb = cat_emb * cat_scale
 
-            # 动态上下文融合（用 CLS 做全局信息）
-            # 这里不提前 encoder，直接用后续的最后一层输出
-            # 完全不破坏你的流程
-            inputs_embeds = inputs_embeds + enhanced_cat_emb
+            # 注意力机制融合
+            # 使用文本嵌入作为查询，类别嵌入作为键值
+            attn_output, _ = self.attention_fusion(
+                query=inputs_embeds,
+                key=enhanced_cat_emb,
+                value=enhanced_cat_emb,
+                key_padding_mask=(category_ids[:, :L] == 0) if attention_mask is None else None
+            )
+
+            # 利用 CLS 标记的全局信息进行上下文融合
+            # 提取 CLS 标记的表示
+            cls_emb = inputs_embeds[:, 0:1, :].repeat(1, L, 1)
+            # 融合 CLS 信息和注意力输出
+            fused_emb = self.context_fusion(torch.cat([attn_output, cls_emb], dim=-1))
+
+            # 加权融合到原始嵌入
+            inputs_embeds = inputs_embeds + fused_emb
 
         # ======================
         # 3. 完全交给父类 forward
