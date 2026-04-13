@@ -137,6 +137,8 @@ def main():
     trainer.args.save_strategy = "epoch"
     trainer.args.save_total_limit = 1  # 只保存一个模型
     trainer.args.load_best_model_at_end = True  # 训练结束后加载最优模型
+    trainer.args.metric_for_best_model = "eval_loss"  # 指定评估指标
+    trainer.args.greater_is_better = False  # 损失越小越好
     trainer.train()
 
 
