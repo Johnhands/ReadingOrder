@@ -22,46 +22,40 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
 
         hidden_size = config.hidden_size
 
-        # 1. 类别嵌入（Xavier 初始化）
+        # 1. 类别嵌入（He 初始化）
         self.category_embedding = nn.Embedding(
             num_embeddings=num_categories,
             embedding_dim=hidden_size,
             padding_idx=0,
         )
-        nn.init.xavier_uniform_(self.category_embedding.weight)
+        nn.init.kaiming_uniform_(self.category_embedding.weight)
         # 保持 padding_idx 为 0
         self.category_embedding.weight.data[0] = 0
 
-        # 2. 类别专属scale（Xavier 初始化）
+        # 2. 类别专属scale（He 初始化）
         self.category_scale = nn.Embedding(
             num_embeddings=num_categories,
             embedding_dim=hidden_size,
             padding_idx=0,
         )
-        nn.init.xavier_uniform_(self.category_scale.weight)
+        nn.init.kaiming_uniform_(self.category_scale.weight)
         # 保持 padding_idx 为 0
         self.category_scale.weight.data[0] = 0
 
-        # 3. 上下文融合
-        self.context_fusion = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
-        )
-        for module in self.context_fusion.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        # 3. 门控融合机制
+        self.gate_proj = nn.Linear(hidden_size * 2, hidden_size)
+        nn.init.xavier_uniform_(self.gate_proj.weight)
+        if self.gate_proj.bias is not None:
+            nn.init.zeros_(self.gate_proj.bias)
 
-        # 4. 注意力机制融合
-        self.attention_fusion = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=config.num_attention_heads,
-            dropout=config.attention_probs_dropout_prob,
-            batch_first=True
-        )
+        # 4. 线性融合
+        self.category_proj = nn.Linear(hidden_size * 2, hidden_size)
+        nn.init.xavier_uniform_(self.category_proj.weight)
+        if self.category_proj.bias is not None:
+            nn.init.zeros_(self.category_proj.bias)
+
+        # 5. Dropout 防止过拟合
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     # ----------------------
     # 你原来的函数，完全保留
@@ -74,13 +68,13 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
             return emb(input_ids=input_ids, bbox=bbox, position_ids=position_ids)
 
     def get_optimized_param_groups(self, pretrained_lr: float, new_module_lr: float) -> List[Dict]:
-        new_names = {"category_embedding", "category_scale", "context_fusion"}
+        new_names = {"category_embedding", "category_scale", "gate_proj", "category_proj", "dropout"}
         pretrained, new = [], []
         for name, param in self.named_parameters():
             (new if name.split(".")[0] in new_names else pretrained).append(param)
         return [
             {"params": pretrained, "lr": pretrained_lr},
-            {"params": new, "lr": new_module_lr},
+            {"params": new, "lr": new_module_lr * 2},  # 增加新模块的学习率
         ]
 
     # ==============================================
@@ -126,24 +120,16 @@ class CategoryLayoutLMv3(LayoutLMv3ForTokenClassification):
             cat_emb = self.category_embedding(cat_ids)
             cat_scale = self.category_scale(cat_ids)
             enhanced_cat_emb = cat_emb * cat_scale
+            enhanced_cat_emb = self.dropout(enhanced_cat_emb)
 
-            # 注意力机制融合
-            # 使用文本嵌入作为查询，类别嵌入作为键值
-            attn_output, _ = self.attention_fusion(
-                query=inputs_embeds,
-                key=enhanced_cat_emb,
-                value=enhanced_cat_emb,
-                key_padding_mask=(category_ids[:, :L] == 0) if attention_mask is None else None
-            )
+            # 门控融合机制
+            combined = torch.cat([inputs_embeds, enhanced_cat_emb], dim=-1)
+            gate = torch.sigmoid(self.gate_proj(combined))
+            inputs_embeds = inputs_embeds * (1 - gate) + enhanced_cat_emb * gate
 
-            # 利用 CLS 标记的全局信息进行上下文融合
-            # 提取 CLS 标记的表示
-            cls_emb = inputs_embeds[:, 0:1, :].repeat(1, L, 1)
-            # 融合 CLS 信息和注意力输出
-            fused_emb = self.context_fusion(torch.cat([attn_output, cls_emb], dim=-1))
-
-            # 加权融合到原始嵌入
-            inputs_embeds = inputs_embeds + fused_emb
+            # 额外的线性融合，增强特征表达
+            combined = torch.cat([inputs_embeds, enhanced_cat_emb], dim=-1)
+            inputs_embeds = inputs_embeds + self.dropout(self.category_proj(combined))
 
         # ======================
         # 3. 完全交给父类 forward
